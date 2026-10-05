@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Data;
 using JasperFx.Core;
 using JasperFx.Events.Daemon;
@@ -17,23 +18,38 @@ namespace Weasel.SqlServer;
 /// </summary>
 public class AdvisoryLock : IAdvisoryLock
 {
+    private const int ProbeTimeoutSeconds = 5;
+
     private readonly Func<SqlConnection> _source;
     private readonly ILogger _logger;
     private readonly string _databaseName;
-    private SqlConnection _conn;
-    private readonly List<int> _locks = new();
+    private readonly TimeSpan _monitoringInterval;
+
+    // The monitor shares the connection, and SqlConnection does not support concurrent commands
+    private readonly SemaphoreSlim _gate = new(1, 1);
+
+    private volatile SqlConnection? _conn;
+    private volatile ImmutableHashSet<int> _locks = ImmutableHashSet<int>.Empty;
+    private PeriodicTimer? _monitorTimer;
+    private Task? _monitor;
     private volatile bool _disposed;
 
     public AdvisoryLock(Func<SqlConnection> source, ILogger logger, string databaseName)
+        : this(source, logger, databaseName, 5.Seconds())
+    {
+    }
+
+    internal AdvisoryLock(Func<SqlConnection> source, ILogger logger, string databaseName, TimeSpan monitoringInterval)
     {
         _source = source;
         _logger = logger;
         _databaseName = databaseName;
+        _monitoringInterval = monitoringInterval;
     }
 
     public bool HasLock(int lockId)
     {
-        return _conn is not { State: ConnectionState.Closed } && _locks.Contains(lockId);
+        return _conn is { State: ConnectionState.Open } && _locks.Contains(lockId);
     }
 
     public async Task<bool> TryAttainLockAsync(int lockId, CancellationToken token)
@@ -45,40 +61,39 @@ public class AdvisoryLock : IAdvisoryLock
 
         try
         {
-            if (_conn == null)
+            await _gate.WaitAsync(token).ConfigureAwait(false);
+            try
             {
-                _conn = _source();
-                await _conn.OpenAsync(token).ConfigureAwait(false);
-            }
+                if (_disposed) return false;
 
-            if (_conn.State == ConnectionState.Closed)
-            {
+                var conn = await connectAsync(token).ConfigureAwait(false);
+
+                // Session locks are reentrant: taking it again would take a second release to free it
+                if (_locks.Contains(lockId)) return true;
+
                 try
                 {
-                    await _conn.DisposeAsync().ConfigureAwait(false);
+                    if (!await conn.TryGetGlobalLock(lockId.ToString(), cancellation: token).ConfigureAwait(false))
+                    {
+                        return false;
+                    }
                 }
                 catch (Exception e)
                 {
-                    _logger.LogError(e, "Error trying to clean up and restart an advisory lock connection");
-                }
-                finally
-                {
-                    _conn = null;
+                    // A dead session, or a cancel that may have landed after the grant: ending the session leaves nothing in doubt
+                    await endSessionAsync(lost: true, e).ConfigureAwait(false);
+                    throw;
                 }
 
-                return false;
-            }
+                _locks = _locks.Add(lockId);
+                startMonitoring();
 
-
-
-            var attained = await _conn.TryGetGlobalLock(lockId.ToString(), cancellation: token).ConfigureAwait(false);
-            if (attained)
-            {
-                _locks.Add(lockId);
                 return true;
             }
-
-            return false;
+            finally
+            {
+                _gate.Release();
+            }
         }
         catch (ObjectDisposedException)
         {
@@ -177,25 +192,41 @@ public class AdvisoryLock : IAdvisoryLock
 
     public async Task ReleaseLockAsync(int lockId)
     {
-        if (!_locks.Contains(lockId)) return;
-
-        if (_conn == null || _conn.State == ConnectionState.Closed)
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
         {
-            _locks.Remove(lockId);
-            return;
+            if (!_locks.Contains(lockId)) return;
+
+            if (_conn is not { State: ConnectionState.Open } conn)
+            {
+                await endSessionAsync(lost: true).ConfigureAwait(false);
+                return;
+            }
+
+            var cancellation = new CancellationTokenSource();
+            cancellation.CancelAfter(1.Seconds());
+
+            try
+            {
+                await conn.ReleaseGlobalLock(lockId.ToString(), cancellation: cancellation.Token).ConfigureAwait(false);
+            }
+            catch (Exception e)
+            {
+                // Ending the session releases this lock whatever went wrong, and the others with it
+                await endSessionAsync(lost: true, e).ConfigureAwait(false);
+                return;
+            }
+
+            _locks = _locks.Remove(lockId);
+
+            if (_locks.IsEmpty)
+            {
+                await endSessionAsync(lost: false).ConfigureAwait(false);
+            }
         }
-
-        var cancellation = new CancellationTokenSource();
-        cancellation.CancelAfter(1.Seconds());
-
-        await _conn.ReleaseGlobalLock(lockId.ToString(), cancellation: cancellation.Token).ConfigureAwait(false);
-        _locks.Remove(lockId);
-
-        if (!_locks.Any())
+        finally
         {
-            await _conn.CloseAsync().ConfigureAwait(false);
-            await _conn.DisposeAsync().ConfigureAwait(false);
-            _conn = null;
+            _gate.Release();
         }
     }
 
@@ -204,26 +235,131 @@ public class AdvisoryLock : IAdvisoryLock
         // Set first, before disposing the connection, so any concurrent TryAttainLockAsync short-circuits (weasel#349).
         _disposed = true;
 
-        if (_conn == null) return;
-
+        Task? monitor;
+        await _gate.WaitAsync().ConfigureAwait(false);
         try
         {
-            foreach (var i in _locks)
+            monitor = _monitor;
+            _monitorTimer?.Dispose();
+
+            if (_conn is { State: ConnectionState.Open } conn)
             {
-                await _conn.ReleaseGlobalLock(i.ToString(), CancellationToken.None).ConfigureAwait(false);
+                foreach (var lockId in _locks)
+                {
+                    try
+                    {
+                        await conn.ReleaseGlobalLock(lockId.ToString(), CancellationToken.None).ConfigureAwait(false);
+                    }
+                    catch (Exception e)
+                    {
+                        // Closing the connection below ends the session, which releases it anyway
+                        _logger.LogDebug(e, "Unable to release advisory lock {LockId} for database {Identifier}",
+                            lockId, _databaseName);
+                    }
+                }
             }
 
-            await _conn.CloseAsync().ConfigureAwait(false);
-            await _conn.DisposeAsync().ConfigureAwait(false);
-        }
-        catch (Exception e)
-        {
-            _logger.LogError(e, "Error trying to dispose of advisory locks for database {Identifier}",
-                _databaseName);
+            await endSessionAsync(lost: false).ConfigureAwait(false);
         }
         finally
         {
-            await _conn.DisposeAsync().ConfigureAwait(false);
+            _gate.Release();
+        }
+
+        if (monitor != null)
+        {
+            await monitor.ConfigureAwait(false);
+        }
+    }
+
+    // Callers hold _gate
+    private async Task<SqlConnection> connectAsync(CancellationToken token)
+    {
+        if (_conn is { State: ConnectionState.Open } open) return open;
+
+        await endSessionAsync(lost: true).ConfigureAwait(false);
+
+        var conn = _source();
+        try
+        {
+            // Unpooled and never silently reconnected, so this connection and the session holding the locks end together
+            conn.ConnectionString = new SqlConnectionStringBuilder(conn.ConnectionString)
+            {
+                Pooling = false,
+                ConnectRetryCount = 0
+            }.ConnectionString;
+
+            await conn.OpenAsync(token).ConfigureAwait(false);
+        }
+        catch
+        {
+            await conn.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+
+        _conn = conn;
+        return conn;
+    }
+
+    // Callers hold _gate. Every lock belongs to the connection's session, so SQL Server releases them all when it ends.
+    private async Task endSessionAsync(bool lost, Exception? cause = null)
+    {
+        var conn = _conn;
+        var held = _locks;
+        _conn = null;
+        _locks = ImmutableHashSet<int>.Empty;
+
+        if (lost && !held.IsEmpty)
+        {
+            _logger.LogWarning(cause, "Lost advisory locks {LockIds} for database {Identifier}: the session holding them has ended",
+                held, _databaseName);
+        }
+
+        if (conn == null) return;
+
+        try
+        {
+            await conn.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            _logger.LogDebug(e, "Error disposing the advisory lock connection for database {Identifier}", _databaseName);
+        }
+    }
+
+    // Callers hold _gate
+    private void startMonitoring()
+    {
+        if (_monitor != null || _disposed) return;
+
+        _monitorTimer = new PeriodicTimer(_monitoringInterval);
+        _monitor = monitorAsync(_monitorTimer);
+    }
+
+    // A node holding every lock sends nothing on its connection, so only a probe notices the session ending
+    private async Task monitorAsync(PeriodicTimer timer)
+    {
+        while (await timer.WaitForNextTickAsync(CancellationToken.None).ConfigureAwait(false))
+        {
+            await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            try
+            {
+                if (_conn is { } conn && !_locks.IsEmpty)
+                {
+                    await using var cmd = conn.CreateCommand();
+                    cmd.CommandText = "SELECT 1";
+                    cmd.CommandTimeout = ProbeTimeoutSeconds;
+                    await cmd.ExecuteScalarAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+            }
+            catch (Exception e)
+            {
+                await endSessionAsync(lost: true, e).ConfigureAwait(false);
+            }
+            finally
+            {
+                _gate.Release();
+            }
         }
     }
 }
